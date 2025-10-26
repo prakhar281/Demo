@@ -1,0 +1,429 @@
+// pom.xml dependencies needed:
+/*
+<dependency>
+    <groupId>com.microsoft.graph</groupId>
+    <artifactId>microsoft-graph</artifactId>
+    <version>5.74.0</version>
+</dependency>
+<dependency>
+    <groupId>com.azure</groupId>
+    <artifactId>azure-identity</artifactId>
+    <version>1.11.1</version>
+</dependency>
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-web</artifactId>
+</dependency>
+<dependency>
+    <groupId>org.projectlombok</groupId>
+    <artifactId>lombok</artifactId>
+    <optional>true</optional>
+</dependency>
+*/
+
+// application.properties
+/*
+azure.ad.tenant-id=your-tenant-id
+azure.ad.client-id=your-client-id
+azure.ad.client-secret=your-client-secret
+*/
+
+package com.wipro.dexcenter.service;
+
+import com.azure.identity.ClientSecretCredential;
+import com.azure.identity.ClientSecretCredentialBuilder;
+import com.microsoft.graph.models.Group;
+import com.microsoft.graph.models.User;
+import com.microsoft.graph.requests.GraphServiceClient;
+import com.microsoft.graph.requests.GroupCollectionPage;
+import com.microsoft.graph.requests.DirectoryObjectCollectionWithReferencesPage;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Service;
+
+import javax.annotation.PostConstruct;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.stream.Collectors;
+
+@Slf4j
+@Service
+public class AzureADGroupService {
+
+    @Value("${azure.ad.tenant-id}")
+    private String tenantId;
+
+    @Value("${azure.ad.client-id}")
+    private String clientId;
+
+    @Value("${azure.ad.client-secret}")
+    private String clientSecret;
+
+    private GraphServiceClient<okhttp3.Request> graphClient;
+
+    @PostConstruct
+    public void init() {
+        try {
+            ClientSecretCredential credential = new ClientSecretCredentialBuilder()
+                    .clientId(clientId)
+                    .clientSecret(clientSecret)
+                    .tenantId(tenantId)
+                    .build();
+
+            graphClient = GraphServiceClient.builder()
+                    .authenticationProvider(new TokenCredentialAuthProvider(credential))
+                    .buildClient();
+
+            log.info("Azure AD Graph Client initialized successfully");
+        } catch (Exception e) {
+            log.error("Failed to initialize Azure AD Graph Client", e);
+            throw new RuntimeException("Azure AD initialization failed", e);
+        }
+    }
+
+    /**
+     * Task 1: Find out all the groups on Azure Active Directory Server
+     * @return List of all AD groups
+     */
+    public List<Group> getAllGroups() {
+        log.info("Fetching all groups from Azure AD");
+        List<Group> allGroups = new ArrayList<>();
+
+        try {
+            GroupCollectionPage groupPage = graphClient.groups()
+                    .buildRequest()
+                    .select("id,displayName,description,mail,mailEnabled,securityEnabled")
+                    .get();
+
+            while (groupPage != null) {
+                allGroups.addAll(groupPage.getCurrentPage());
+                
+                if (groupPage.getNextPage() == null) {
+                    break;
+                }
+                groupPage = groupPage.getNextPage().buildRequest().get();
+            }
+
+            log.info("Successfully fetched {} groups", allGroups.size());
+            return allGroups;
+
+        } catch (Exception e) {
+            log.error("Error fetching all groups", e);
+            throw new RuntimeException("Failed to fetch groups from Azure AD", e);
+        }
+    }
+
+    /**
+     * Task 2: Find out all the users of a particular group
+     * @param groupId The ID of the group
+     * @return List of users in the group
+     */
+    public List<User> getGroupMembers(String groupId) {
+        log.info("Fetching members for group: {}", groupId);
+        List<User> allMembers = new ArrayList<>();
+
+        try {
+            DirectoryObjectCollectionWithReferencesPage memberPage = graphClient
+                    .groups(groupId)
+                    .members()
+                    .buildRequest()
+                    .select("id,displayName,userPrincipalName,mail,jobTitle,department")
+                    .get();
+
+            while (memberPage != null) {
+                List<User> users = memberPage.getCurrentPage().stream()
+                        .filter(obj -> obj instanceof User)
+                        .map(obj -> (User) obj)
+                        .collect(Collectors.toList());
+                
+                allMembers.addAll(users);
+
+                if (memberPage.getNextPage() == null) {
+                    break;
+                }
+                memberPage = memberPage.getNextPage().buildRequest().get();
+            }
+
+            log.info("Successfully fetched {} members from group {}", allMembers.size(), groupId);
+            return allMembers;
+
+        } catch (Exception e) {
+            log.error("Error fetching members for group: {}", groupId, e);
+            throw new RuntimeException("Failed to fetch group members from Azure AD", e);
+        }
+    }
+
+    /**
+     * Task 3: Find what groups a particular user is part of
+     * @param userId User principal name or object ID
+     * @return List of groups the user belongs to
+     */
+    public List<Group> getUserGroups(String userId) {
+        log.info("Fetching groups for user: {}", userId);
+        List<Group> allGroups = new ArrayList<>();
+
+        try {
+            DirectoryObjectCollectionWithReferencesPage groupPage = graphClient
+                    .users(userId)
+                    .memberOf()
+                    .buildRequest()
+                    .select("id,displayName,description,mail")
+                    .get();
+
+            while (groupPage != null) {
+                List<Group> groups = groupPage.getCurrentPage().stream()
+                        .filter(obj -> obj instanceof Group)
+                        .map(obj -> (Group) obj)
+                        .collect(Collectors.toList());
+                
+                allGroups.addAll(groups);
+
+                if (groupPage.getNextPage() == null) {
+                    break;
+                }
+                groupPage = groupPage.getNextPage().buildRequest().get();
+            }
+
+            log.info("User {} is member of {} groups", userId, allGroups.size());
+            return allGroups;
+
+        } catch (Exception e) {
+            log.error("Error fetching groups for user: {}", userId, e);
+            throw new RuntimeException("Failed to fetch user groups from Azure AD", e);
+        }
+    }
+
+    /**
+     * Get group by display name
+     */
+    public Group getGroupByName(String groupName) {
+        log.info("Searching for group by name: {}", groupName);
+        
+        try {
+            GroupCollectionPage groups = graphClient.groups()
+                    .buildRequest()
+                    .filter(String.format("displayName eq '%s'", groupName))
+                    .get();
+
+            if (groups.getCurrentPage().isEmpty()) {
+                log.warn("No group found with name: {}", groupName);
+                return null;
+            }
+
+            return groups.getCurrentPage().get(0);
+
+        } catch (Exception e) {
+            log.error("Error searching for group: {}", groupName, e);
+            throw new RuntimeException("Failed to search for group", e);
+        }
+    }
+
+    /**
+     * Check if user is member of a specific group
+     */
+    public boolean isUserMemberOfGroup(String userId, String groupId) {
+        log.info("Checking if user {} is member of group {}", userId, groupId);
+        
+        try {
+            List<Group> userGroups = getUserGroups(userId);
+            return userGroups.stream()
+                    .anyMatch(group -> group.id.equals(groupId));
+
+        } catch (Exception e) {
+            log.error("Error checking group membership", e);
+            return false;
+        }
+    }
+}
+
+// REST Controller - Returns Microsoft Graph models directly
+package com.wipro.dexcenter.controller;
+
+import com.microsoft.graph.models.Group;
+import com.microsoft.graph.models.User;
+import com.wipro.dexcenter.service.AzureADGroupService;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.List;
+
+@Slf4j
+@RestController
+@RequestMapping("/api/azure-ad")
+@RequiredArgsConstructor
+public class AzureADController {
+
+    private final AzureADGroupService azureADGroupService;
+
+    /**
+     * Task 1: Get all groups from Azure AD
+     * Returns: List of Group objects with all properties
+     */
+    @GetMapping("/groups")
+    public ResponseEntity<List<Group>> getAllGroups() {
+        log.info("REST API: Fetching all groups");
+        
+        try {
+            List<Group> groups = azureADGroupService.getAllGroups();
+            return ResponseEntity.ok(groups);
+        } catch (Exception e) {
+            log.error("Error in getAllGroups endpoint", e);
+            return ResponseEntity.internalServerError().build();
+        }
+    }
+
+    /**
+     * Task 2: Get all members of a specific group
+     * Returns: List of User objects with all properties
+     */
+    @GetMapping("/groups/{groupId}/members")
+    public ResponseEntity<List<User>> getGroupMembers(@PathVariable String groupId) {
+        log.info("REST API: Fetching members for group: {}", groupId);
+        
+        try {
+            List<User> members = azureADGroupService.getGroupMembers(groupId);
+            return ResponseEntity.ok(members);
+        } catch (Exception e) {
+            log.error("Error in getGroupMembers endpoint", e);
+            return ResponseEntity.internalServerError().build();
+        }
+    }
+
+    /**
+     * Task 3: Get all groups a user belongs to
+     * Returns: List of Group objects
+     */
+    @GetMapping("/users/{userId}/groups")
+    public ResponseEntity<List<Group>> getUserGroups(@PathVariable String userId) {
+        log.info("REST API: Fetching groups for user: {}", userId);
+        
+        try {
+            List<Group> groups = azureADGroupService.getUserGroups(userId);
+            return ResponseEntity.ok(groups);
+        } catch (Exception e) {
+            log.error("Error in getUserGroups endpoint", e);
+            return ResponseEntity.internalServerError().build();
+        }
+    }
+
+    /**
+     * Get specific group details by ID
+     */
+    @GetMapping("/groups/{groupId}")
+    public ResponseEntity<Group> getGroupById(@PathVariable String groupId) {
+        log.info("REST API: Fetching group details for: {}", groupId);
+        
+        try {
+            List<Group> groups = azureADGroupService.getAllGroups();
+            Group group = groups.stream()
+                    .filter(g -> g.id.equals(groupId))
+                    .findFirst()
+                    .orElse(null);
+            
+            if (group == null) {
+                return ResponseEntity.notFound().build();
+            }
+            return ResponseEntity.ok(group);
+        } catch (Exception e) {
+            log.error("Error in getGroupById endpoint", e);
+            return ResponseEntity.internalServerError().build();
+        }
+    }
+
+    /**
+     * Search group by name
+     */
+    @GetMapping("/groups/search")
+    public ResponseEntity<Group> searchGroupByName(@RequestParam String name) {
+        log.info("REST API: Searching group by name: {}", name);
+        
+        try {
+            Group group = azureADGroupService.getGroupByName(name);
+            if (group == null) {
+                return ResponseEntity.notFound().build();
+            }
+            return ResponseEntity.ok(group);
+        } catch (Exception e) {
+            log.error("Error in searchGroupByName endpoint", e);
+            return ResponseEntity.internalServerError().build();
+        }
+    }
+
+    /**
+     * Get specific user details by ID
+     */
+    @GetMapping("/users/{userId}")
+    public ResponseEntity<User> getUserById(@PathVariable String userId) {
+        log.info("REST API: Fetching user details for: {}", userId);
+        
+        try {
+            // Get user from any group they belong to
+            List<Group> userGroups = azureADGroupService.getUserGroups(userId);
+            if (!userGroups.isEmpty()) {
+                List<User> members = azureADGroupService.getGroupMembers(userGroups.get(0).id);
+                User user = members.stream()
+                        .filter(u -> u.id.equals(userId) || u.userPrincipalName.equals(userId))
+                        .findFirst()
+                        .orElse(null);
+                
+                if (user == null) {
+                    return ResponseEntity.notFound().build();
+                }
+                return ResponseEntity.ok(user);
+            }
+            return ResponseEntity.notFound().build();
+        } catch (Exception e) {
+            log.error("Error in getUserById endpoint", e);
+            return ResponseEntity.internalServerError().build();
+        }
+    }
+
+    /**
+     * Check if user is member of group
+     */
+    @GetMapping("/users/{userId}/groups/{groupId}/membership")
+    public ResponseEntity<Boolean> checkGroupMembership(
+            @PathVariable String userId,
+            @PathVariable String groupId) {
+        log.info("REST API: Checking membership of user {} in group {}", userId, groupId);
+        
+        try {
+            boolean isMember = azureADGroupService.isUserMemberOfGroup(userId, groupId);
+            return ResponseEntity.ok(isMember);
+        } catch (Exception e) {
+            log.error("Error in checkGroupMembership endpoint", e);
+            return ResponseEntity.internalServerError().build();
+        }
+    }
+}
+
+// Authentication Provider
+package com.wipro.dexcenter.service;
+
+import com.azure.core.credential.AccessToken;
+import com.azure.core.credential.TokenCredential;
+import com.azure.core.credential.TokenRequestContext;
+import com.microsoft.graph.authentication.IAuthenticationProvider;
+import lombok.RequiredArgsConstructor;
+
+import java.net.URL;
+import java.util.concurrent.CompletableFuture;
+
+@RequiredArgsConstructor
+public class TokenCredentialAuthProvider implements IAuthenticationProvider {
+    
+    private final TokenCredential tokenCredential;
+    private static final String[] SCOPES = new String[] { "https://graph.microsoft.com/.default" };
+
+    @Override
+    public CompletableFuture<String> getAuthorizationTokenAsync(URL requestUrl) {
+        TokenRequestContext context = new TokenRequestContext();
+        context.addScopes(SCOPES);
+        
+        return tokenCredential.getToken(context)
+                .toFuture()
+                .thenApply(AccessToken::getToken);
+    }
+}
